@@ -138,13 +138,15 @@ func addDirChanges(ctx context.Context, changeFn ChangeFunc, root string) error 
 // a diff directory to its base, without walking both trees.
 type DiffDirOptions struct {
 	DiffDir      string
+	DiffViewDir  string
 	SkipChange   func(string) (bool, error)
-	DeleteChange func(string, string, string, os.FileInfo) (string, bool, error)
+	DeleteChange func(string, string, string, os.FileInfo) (path string, skip bool, opaque bool, err error)
 }
 
 // DiffDirChanges walks the diff directory and compares changes against the base.
 func DiffDirChanges(ctx context.Context, changeFn ChangeFunc, base string, o *DiffDirOptions) error {
 	changedDirs := make(map[string]struct{})
+	opaqueDirs := make(map[string]struct{})
 	return filepath.Walk(o.DiffDir, func(path string, f os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -156,15 +158,20 @@ func DiffDirChanges(ctx context.Context, changeFn ChangeFunc, base string, o *Di
 			return err
 		}
 
+		for opq := range opaqueDirs {
+			if strings.HasPrefix(path, opq) {
+				// This file is under that opaque directory that is already precessed
+				// using double walker. We can skip this.
+				return nil
+			}
+		}
+
 		path = filepath.Join(string(os.PathSeparator), path)
 
 		// Skip root
 		if path == string(os.PathSeparator) {
 			return nil
 		}
-
-		// TODO: handle opaqueness, start new double walker at this
-		// location to get deletes, and skip tree in single walker
 
 		if o.SkipChange != nil {
 			if skip, err := o.SkipChange(path); skip {
@@ -175,9 +182,10 @@ func DiffDirChanges(ctx context.Context, changeFn ChangeFunc, base string, o *Di
 		var kind ChangeKind
 
 		var deletedFile string
+		var opaque bool
 		if o.DeleteChange != nil {
 			var skip bool
-			deletedFile, skip, err = o.DeleteChange(o.DiffDir, path, base, f)
+			deletedFile, skip, opaque, err = o.DeleteChange(o.DiffDir, path, base, f)
 			if err != nil {
 				return err
 			}
@@ -233,8 +241,29 @@ func DiffDirChanges(ctx context.Context, changeFn ChangeFunc, base string, o *Di
 			}
 		}
 
-		return changeFn(kind, path, f, nil)
+		if err := changeFn(kind, path, f, nil); err != nil {
+			return err
+		}
+
+		if opaque {
+			// start new double walker to get deletes
+			// We use another directory which doesn't contain whiteouts.
+			if err := doubleWalkDiff(ctx, rebaseChangeFn(path, changeFn),
+				filepath.Join(base, path), filepath.Join(o.DiffViewDir, path)); err != nil {
+				return err
+			}
+			// skip tree in single walker
+			opaqueDirs[path] = struct{}{}
+		}
+
+		return nil
 	})
+}
+
+func rebaseChangeFn(base string, changeFn ChangeFunc) ChangeFunc {
+	return func(k ChangeKind, p string, f os.FileInfo, err error) error {
+		return changeFn(k, filepath.Join(base, p), f, err)
+	}
 }
 
 // doubleWalkDiff walks both directories to create a diff
